@@ -126,7 +126,7 @@ def download_image(image_url: str, referer: str | None = None) -> BytesIO | None
     if referer:
         headers["Referer"] = referer
     try:
-        resp = session.get(image_url, headers=headers, stream=True, timeout=12)
+        resp = session.get(image_url, headers=headers, stream=True, timeout=5)
         resp.raise_for_status()
         ctype = (resp.headers.get("Content-Type") or "").lower()
         if not (ctype.startswith("image/") or any(x in ctype for x in ["webp","jpeg","png","jpg"])):
@@ -191,7 +191,7 @@ if up_orders and up_master:
 
         def fetch_one(idx: int, url: str, sku: str):
             try:
-                resp = session.get(url, timeout=12)
+                resp = session.get(url, timeout=5)
                 resp.raise_for_status()
                 html = resp.text
                 return idx, (pick_rakuten_image(html) or None), url
