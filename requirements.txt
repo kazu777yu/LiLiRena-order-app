@@ -2,6 +2,5 @@ streamlit
 pandas
 openpyxl
 requests
-beautifulsoup4
-lxml
 pillow
+beautifulsoup4

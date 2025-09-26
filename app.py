@@ -1,155 +1,111 @@
-import io
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import json
-
-import pandas as pd
-import requests
-from bs4 import BeautifulSoup
-from PIL import Image as PILImage
-from io import BytesIO
-
 import streamlit as st
+import pandas as pd
+from io import BytesIO
+from PIL import Image as PILImage
+import requests
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-st.set_page_config(page_title="発注書 自動生成（楽天画像専用）", page_icon="🧾", layout="wide")
-st.title("🧾 発注書 自動生成｜画像は楽天のみから取得")
+# ====== 固定設定 ======
+SHOP_ID = "lilirena"     # 楽天ショップID
+MAX_WORKERS = 12         # 並列取得 固定（スライダー廃止）
+IMG_MAX_H = 120          # 画像高さ(px)固定
+IMG_COL_WIDTH = 18       # B列の幅(文字数)固定
+# =====================
 
-# ------- UI -------
-col1, col2 = st.columns(2)
-up_orders = col1.file_uploader("受注CSV（列: sku, 購入数）", type=["csv"])
-up_master = col2.file_uploader("DB（Excel: sku, 原価, 商品URL, 商品名称, 特記事項）", type=["xlsx","xls"])
+st.set_page_config(page_title="Order Maker", page_icon="🧾", layout="centered")
 
-order_date = st.date_input("発注日", value=datetime.now().date())
-img_max_h = st.number_input("画像の最大高さ(px)", min_value=60, max_value=240, value=120)
-img_col_width = st.number_input("B列の幅(文字数)", min_value=10, max_value=40, value=18)
+# --- NE風スタイル（青ボタン＆青タイトル） ---
+st.markdown("""
+<style>
+:root { --ne-blue:#2a6df4; }
+.block-container { max-width: 880px; }
+.titlebar { font-size:22px; font-weight:800; display:flex; gap:10px; align-items:center; color:var(--ne-blue); }
+.titlebar:before{content:"📄";}
+.subtle{color:#667085; font-size:13px; margin-bottom:8px;}
+.card{border:1px solid #e6e9ef; border-radius:14px; padding:22px; margin:14px 0; background:#fff; box-shadow:0 2px 8px rgba(16,24,40,.04);}
+.drop{border:2px dashed #d5d9e3; border-radius:12px; padding:28px; text-align:center; color:#6b7280; background:#fafbff;}
+/* Streamlitのボタン強制ブルー化 */
+.stButton > button {
+  width: 100%; height: 52px; font-weight: 700; border-radius: 10px; font-size: 16px;
+  background: var(--ne-blue) !important; color: #fff !important; border: none !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
-st.markdown("---")
-left, right = st.columns([2,1])
-rakuten_shop = left.text_input("楽天のショップID（例: lilirena）", value="lilirena")
-max_workers = right.slider("並列取得数", 2, 12, 6)
+st.markdown('<div class="titlebar">Order Maker</div><div class="subtle">発注書自動作成</div>', unsafe_allow_html=True)
+
+with st.container():
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        st.markdown('<div class="drop">受注データ</div>', unsafe_allow_html=True)
+        up_orders = st.file_uploader("ファイルを選択", type=["csv"], label_visibility="collapsed", key="orders")
+    with c2:
+        st.markdown('<div class="drop">商品マスタ</div>', unsafe_allow_html=True)
+        up_master = st.file_uploader("ファイルを選択", type=["xlsx","xls"], label_visibility="collapsed", key="master")
+    st.markdown('</div>', unsafe_allow_html=True)
 
 # ------- HTTP client -------
 DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/120.0.0.0 Safari/537.36"),
     "Accept-Language": "ja,en;q=0.9",
 }
-
 session = requests.Session()
 session.headers.update(DEFAULT_HEADERS)
 
 # ------- helpers -------
-
 def normalize_sku(s):
-    if pd.isna(s):
-        return None
+    if pd.isna(s): return None
     return str(s).strip().replace("　"," ").lower()
 
 def base_code_from_sku(sku: str) -> str:
-    if not sku:
-        return ""
-    code = str(sku).split("-")[0].strip()
-    return code
+    if not sku: return ""
+    return str(sku).split("-")[0].strip()
 
-def build_rakuten_url(sku: str, shop: str) -> str:
+def build_rakuten_url(sku: str, shop: str = SHOP_ID) -> str:
     code = base_code_from_sku(sku)
-    if not code or not shop:
-        return ""
+    if not code or not shop: return ""
     return f"https://item.rakuten.co.jp/{shop}/{code}/"
 
 def pick_rakuten_image(html: str) -> str | None:
-    if not html:
-        return None
+    from bs4 import BeautifulSoup
+    if not html: return None
     soup = BeautifulSoup(html, "html.parser")
-
-    for attrs in (
-        {"property": "og:image"},
-        {"name": "og:image"},
-        {"property": "twitter:image"},
-        {"name": "twitter:image"},
-        {"property": "og:image:url"},
-    ):
+    for attrs in ({"property":"og:image"},{"name":"og:image"},
+                  {"property":"twitter:image"},{"name":"twitter:image"},
+                  {"property":"og:image:url"}):
         tag = soup.find("meta", attrs=attrs)
         if tag and tag.get("content"):
             u = tag["content"].strip()
-            if u.startswith("//"): u = "https:" + u
+            if u.startswith("//"): u = "https:"+u
             return u
-
-    for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
-        try:
-            data = json.loads(s.string or "{}")
-        except Exception:
-            continue
-        def extract_img(obj):
-            if isinstance(obj, dict):
-                img = obj.get("image")
-                if isinstance(img, str):
-                    return img
-                if isinstance(img, list) and img:
-                    return img[0]
-            return None
-        if isinstance(data, dict) and data.get("@type") == "Product":
-            u = extract_img(data)
-            if u:
-                return u
-        if isinstance(data, list):
-            for node in data:
-                if isinstance(node, dict) and node.get("@type") == "Product":
-                    u = extract_img(node)
-                    if u:
-                        return u
-
-    for sel in [
-        "#rakutenLimitedId_ImageMain img",
-        "#productMainImage img",
-        "#page-body img",
-        "img",
-    ]:
+    for sel in ["#rakutenLimitedId_ImageMain img", "#productMainImage img", "#page-body img", "img"]:
         el = soup.select_one(sel)
         if el:
             src = el.get("src") or el.get("data-src") or ""
             if src:
-                if src.startswith("//"): src = "https:" + src
+                if src.startswith("//"): src = "https:"+src
                 return src
-
     return None
 
 def download_image(image_url: str, referer: str | None = None) -> BytesIO | None:
-    if not image_url:
-        return None
+    if not image_url: return None
     headers = DEFAULT_HEADERS.copy()
-    if referer:
-        headers["Referer"] = referer
+    if referer: headers["Referer"] = referer
     try:
-        resp = session.get(image_url, headers=headers, stream=True, timeout=5)
+        resp = session.get(image_url, headers=headers, stream=True, timeout=12)
         resp.raise_for_status()
-        ctype = (resp.headers.get("Content-Type") or "").lower()
-        if not (ctype.startswith("image/") or any(x in ctype for x in ["webp","jpeg","png","jpg"])):
-            return None
-        data = BytesIO(resp.content)
-        data.seek(0)
-        return data
-    except Exception:
-        return None
-
-def resize_keep_ratio(bin_io: BytesIO, max_h: int) -> BytesIO | None:
-    try:
-        img = PILImage.open(bin_io)
-        if img.mode not in ("RGB","RGBA"):
-            img = img.convert("RGB")
-        w, h = img.size
-        if h > max_h:
-            scale = max_h / h
-            img = img.resize((int(w*scale), int(h*scale)))
-        out = BytesIO()
-        img.save(out, format="PNG", optimize=True)
-        out.seek(0)
-        return out
+        img = PILImage.open(BytesIO(resp.content))
+        img.thumbnail((IMG_COL_WIDTH*5, IMG_MAX_H))
+        bio = BytesIO()
+        img.save(bio, format="PNG")
+        bio.seek(0)
+        return bio
     except Exception:
         return None
 
@@ -166,7 +122,26 @@ def read_orders(file) -> pd.DataFrame:
             pass
     raise ValueError("受注CSVの列名は 'sku, 購入数' を想定しています。")
 
-if up_orders and up_master:
+# --- 並列取得：楽天→画像URL ---
+def fetch_image(idx: int, sku: str):
+    rak_url = build_rakuten_url(sku)
+    if not rak_url: return idx, "URLなし"
+    try:
+        resp = session.get(rak_url, timeout=12)
+        resp.raise_for_status()
+        img_url = pick_rakuten_image(resp.text)
+        return idx, img_url if img_url else "画像なし"
+    except Exception:
+        return idx, "取得失敗"
+
+# ====== メイン ======
+go = st.button("発注書作成")
+
+if go:
+    if not (up_orders and up_master):
+        st.error("受注データ と 商品マスタ を選択してください。")
+        st.stop()
+
     try:
         orders = read_orders(up_orders)
         master = pd.read_excel(up_master)
@@ -176,118 +151,78 @@ if up_orders and up_master:
             st.stop()
 
         master["sku"] = master["sku"].apply(normalize_sku)
-        orders_sum = orders.groupby("sku",as_index=False)["購入数"].sum().query("購入数>0")
+        orders_sum = orders.groupby("sku", as_index=False)["購入数"].sum().query("購入数>0")
         merged = orders_sum.merge(master, on="sku", how="left")
 
-        st.info("画像URLを楽天から取得中…（見つからなければ『画像なし』）")
+        # 進捗バー：画像URL取得
+        prog = st.progress(0, text="画像URL取得中…")
+        decided = [None]*len(merged)
 
-        decided_urls = [None] * len(merged)
-        to_fetch = []
-
-        for i, r in merged.iterrows():
-            rak_url = build_rakuten_url(r.get("sku"), rakuten_shop)
-            if rak_url:
-                to_fetch.append((i, rak_url, r.get("sku")))
-
-        def fetch_one(idx: int, url: str, sku: str):
-            try:
-                resp = session.get(url, timeout=5)
-                resp.raise_for_status()
-                html = resp.text
-                return idx, (pick_rakuten_image(html) or None), url
-            except Exception:
-                return idx, None, url
-
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = [ex.submit(fetch_one, i, u, s) for (i,u,s) in to_fetch]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = [ex.submit(fetch_image, i, r.get("sku")) for i, r in merged.iterrows()]
+            done = 0; total = len(futures)
             for fut in as_completed(futures):
-                i, img_u, ref = fut.result()
-                decided_urls[i] = img_u
+                idx, url = fut.result()
+                decided[idx] = url
+                done += 1
+                prog.progress(int(done*100/total), text=f"画像URL取得 {done}/{total}")
 
-        merged["画像URL(決定)"] = [u if u else "画像なし" for u in decided_urls]
+        merged["画像URL(決定)"] = decided
+        prog.progress(100, text="画像URL取得 完了")
 
-        st.subheader("プレビュー")
-        st.dataframe(merged[["sku","購入数","商品名称","商品URL","画像URL(決定)"]], use_container_width=True, height=320)
-
-        st.info("Excelを生成中…（画像を埋め込み）")
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "発注書"
-
+        # Excel出力（画像埋め込み）
+        wb = Workbook(); ws = wb.active; ws.title = "発注書"
         headers = ["", "写真", "sku", "購入数", "単価",
                    "特記事項", "商品名称", "商品URL", "変更後URL",
                    "サイズ", "色", "中国内送料",
-                   "単価", "合計", "発注日",
-                   ""]
+                   "単価", "合計", "発注日", ""]
         ws.append(headers)
-        ws.column_dimensions["B"].width = float(img_col_width)
+        ws.column_dimensions["B"].width = float(IMG_COL_WIDTH)
 
-        failed_rows = []
-        embed_ok = 0
-        fallback_image_formula = 0
-        embed_fail = 0
+        d = datetime.now(); date_str = f"{d.year}/{d.month}/{d.day}"
+        ok = fail = 0
 
-        d = order_date
-        date_str = f"{d.year}/{d.month}/{d.day}"
+        prog2 = st.progress(0, text="Excelに画像を埋め込み中…")
+        total_rows = len(merged)
 
-        for _, row in merged.iterrows():
+        # ★ ここを iterrows に変更（列名そのまま使える）
+        for i, (_, row) in enumerate(merged.iterrows(), start=1):
             genka = pd.to_numeric(row.get("原価"), errors="coerce")
             qty = int(row.get("購入数") or 0)
             gokei = (genka * qty) if pd.notna(genka) else None
 
-            excel_row = ["", "", row.get("sku"), qty, "",
+            excel_row = ["", "", row.get("sku"), qty, genka,
                          row.get("特記事項"), row.get("商品名称"),
                          row.get("商品URL"), "", "", "", "",
                          genka, gokei, date_str, ""]
             ws.append(excel_row)
 
             r_i = ws.max_row
-            img_url = row.get("画像URL(決定)")
-            referer = build_rakuten_url(row.get("sku"), rakuten_shop)
+            img_url = row.get("画像URL(決定)")  # ← そのまま参照OK
+            referer = build_rakuten_url(row.get("sku"))
 
-            bin_data = download_image(img_url, referer=referer) if (img_url and img_url != "画像なし") else None
-            if bin_data:
-                bin_resized = resize_keep_ratio(bin_data, max_h=int(img_max_h))
-                if bin_resized:
-                    try:
-                        xlimg = XLImage(bin_resized)
-                        ws.add_image(xlimg, f"B{r_i}")
-                        ws.row_dimensions[r_i].height = int(int(img_max_h) / 1.33)
-                        embed_ok += 1
-                        continue
-                    except Exception:
-                        pass
-
-            if img_url and img_url != "画像なし":
+            bin_io = download_image(img_url, referer=referer) if (img_url and "http" in str(img_url)) else None
+            if bin_io:
                 try:
-                    ws.cell(row=r_i, column=2).value = f'=IMAGE("{img_url}")'
-                    ws.row_dimensions[r_i].height = int(int(img_max_h) / 1.33)
-                    fallback_image_formula += 1
+                    xlimg = XLImage(bin_io)
+                    xlimg.anchor = f"B{r_i}"
+                    ws.add_image(xlimg)
+                    ws.row_dimensions[r_i].height = int(IMG_MAX_H * 0.75)
+                    ok += 1
                 except Exception:
-                    embed_fail += 1
-                    failed_rows.append({"sku": row.get("sku"), "商品URL": row.get("商品URL"), "画像URL": img_url, "理由": "IMAGE関数保険も失敗"})
+                    fail += 1
             else:
-                embed_fail += 1
-                failed_rows.append({"sku": row.get("sku"), "商品URL": row.get("商品URL"), "画像URL": img_url, "理由": "URLなし"})
+                fail += 1
 
-        if failed_rows:
-            ws2 = wb.create_sheet("画像取得失敗")
-            ws2.append(["sku","商品URL","画像URL","理由"])
-            for fr in failed_rows:
-                ws2.append([fr.get("sku"), fr.get("商品URL"), fr.get("画像URL"), fr.get("理由")])
+            prog2.progress(int(i*100/total_rows), text=f"Excel埋め込み {i}/{total_rows}")
 
-        bio = BytesIO()
-        wb.save(bio)
-        bio.seek(0)
+        bio = BytesIO(); wb.save(bio); bio.seek(0)
         filename = f"発注書_{datetime.now().strftime('%Y%m%d')}_画像埋め込み.xlsx"
         st.download_button("📥 発注書（画像埋め込み）をダウンロード",
                            data=bio.getvalue(),
                            file_name=filename,
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-        st.success(f"画像埋め込み 成功: {embed_ok} 件 / 保険(IMAGE関数): {fallback_image_formula} 件 / 失敗: {embed_fail} 件")
+        st.success(f"画像埋め込み 成功: {ok} 件 / 失敗: {fail} 件")
 
     except Exception as e:
         st.error(f"エラー: {e}")
-else:
-    st.info("受注CSVとDBを選ぶと処理できます。")
