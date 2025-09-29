@@ -1,1 +1,6 @@
-streamlitpandasopenpyxlrequestsPillowbeautifulsoup4
+streamlit
+pandas
+openpyxl
+requests
+Pillow
+beautifulsoup4
