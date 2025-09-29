@@ -6,11 +6,11 @@ import requests
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+# from concurrent.futures import ThreadPoolExecutor, as_completed # 並列処理を無効化
 
 # ====== 固定設定 ======
 SHOP_ID = "lilirena"     # 楽天ショップID
-MAX_WORKERS = 12         # 並列取得 固定（スライダー廃止）
+MAX_WORKERS = 12         # 並列取得 固定（スライダー廃止） -> 同期処理になったため、この変数は未使用
 IMG_MAX_H = 120          # 画像高さ(px)固定
 IMG_COL_WIDTH = 18       # B列の幅(文字数)固定
 # =====================
@@ -122,7 +122,7 @@ def read_orders(file) -> pd.DataFrame:
             pass
     raise ValueError("受注CSVの列名は 'sku, 購入数' を想定しています。")
 
-# --- 並列取得：楽天→画像URL ---
+# --- 画像URL取得関数（同期処理で使用） ---
 def fetch_image(idx: int, sku: str):
     rak_url = build_rakuten_url(sku)
     if not rak_url: return idx, "URLなし"
@@ -158,14 +158,13 @@ if go:
         prog = st.progress(0, text="画像URL取得中…")
         decided = [None]*len(merged)
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futures = [ex.submit(fetch_image, i, r.get("sku")) for i, r in merged.iterrows()]
-            done = 0; total = len(futures)
-            for fut in as_completed(futures):
-                idx, url = fut.result()
-                decided[idx] = url
-                done += 1
-                prog.progress(int(done*100/total), text=f"画像URL取得 {done}/{total}")
+        # ★★★ 修正箇所：ThreadPoolExecutor を削除し、同期ループに置き換え ★★★
+        total = len(merged)
+        for i, (_, row) in enumerate(merged.iterrows()):
+            idx, url = fetch_image(i, row.get("sku"))
+            decided[idx] = url
+            prog.progress(int((i + 1) * 100 / total), text=f"画像URL取得 {i + 1}/{total}")
+        # ★★★ 修正箇所終了 ★★★
 
         merged["画像URL(決定)"] = decided
         prog.progress(100, text="画像URL取得 完了")
